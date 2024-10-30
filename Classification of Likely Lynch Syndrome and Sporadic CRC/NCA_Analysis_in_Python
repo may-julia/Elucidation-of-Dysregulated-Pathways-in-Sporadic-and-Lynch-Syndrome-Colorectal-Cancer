@@ -1,0 +1,36 @@
+# NCA Analysis in Python
+import pandas as pd
+from sklearn.neighbors import NeighborhoodComponentsAnalysis as NCA
+
+# Import NCA numeric data with sampleid column 
+processed_NCA_data = pd.read_csv('/Users/maykrause/Documents/Masters/Analysis/2024/Breast_Cancer/2. RNA-based Classification of Breast Cancer (CRC)/Sept/NCA_data.csv')
+
+# Make row names the sampleIds
+NCA_data = processed_NCA_data.set_index('sampleId')
+
+X = NCA_data.drop('LS_Status', axis=1)
+y = NCA_data['LS_Status']
+
+nca = NCA(random_state=42)
+nca.fit(X,y)
+
+X_transformed = nca.transform(X)
+
+# Re-include sample id & LS_Status
+# Convert the NCA-transformed array back to a DataFrame
+X_transformed_df = pd.DataFrame(X_transformed, columns=[f'feature_{i}' for i in range(X_transformed.shape[1])])
+
+# Add 'SampleId' from the index of NCA_data
+X_transformed_df['SampleId'] = NCA_data.index
+
+# Add 'LS_Status' back to the DataFrame. Since LS_Status was dropped from X for NCA transformation, we retrieve it from the original DataFrame
+X_transformed_df['LS_Status'] = NCA_data['LS_Status'].values  # Assuming the order has not been changed
+
+# Reorder the DataFrame to have 'SampleId' and 'LS_Status' at the beginning or end
+cols = ['SampleId'] + [col for col in X_transformed_df.columns if col not in ['SampleId', 'LS_Status']] + ['LS_Status']
+X_transformed_df = X_transformed_df[cols]
+
+# Export to CSV, including 'SampleId' and 'LS_Status'
+X_transformed_df.to_csv('/Users/maykrause/Documents/Masters/Analysis/2024/Breast_Cancer/2. RNA-based Classification of Breast Cancer (CRC)/Sept/NCA_transformed_with_SampleIds_and_LS_Status.csv', index=False)
+
+
