@@ -1,0 +1,625 @@
+# Pipeline ####
+# 1. Data Preprocessing
+# 2. Feature Selection with mRMR
+# 3. NCA
+# 4. K-means clustering
+# 5. Basic Visualization
+
+# Step 1: Data Acquisition and Preprocessing ####
+library(readxl)
+library(dplyr)   # For data manipulation
+library(smotefamily)
+library(mRMRe)  # For feature selection
+library(tidyr)
+library(ggplot2)
+library(stats)
+library(cluster)  # For silhouette function
+library(factoextra)  # For visualization 
+
+# Read mRNA data
+file_path <- "~/Analysis/2024/CRC/coadread_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt"
+mRNA_data <- read.table(file_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+# Replace missing Hugo_Symbol with the corresponding Entrez_Gene_Id
+mRNA_data <- mRNA_data %>%
+  mutate(Hugo_Symbol = ifelse(Hugo_Symbol == "", NA, Hugo_Symbol),
+         Hugo_Symbol = ifelse(is.na(Hugo_Symbol), as.character(Entrez_Gene_Id), Hugo_Symbol)) %>%
+  select(-Entrez_Gene_Id)
+
+# Read sample data and TCGA COAD data
+sample_data <- read_excel("~/Analysis/2024/1. Download cBioportal data/Colorectal Adenocarcinoma (TCGA, PanCancer Atlas) _clin_aug_01_11.xlsx")
+TCGACOAD <- read_excel("~/Analysis/2024/CRC/TCGACOAD.xlsx")
+
+TCGACOAD$Likely_Lynch <- gsub("-", ".", TCGACOAD$Likely_Lynch)
+TCGACOAD$Likely_Sporadic <- gsub("-", ".", TCGACOAD$Likely_Sporadic)
+
+# Process and merge sample data for LS Status
+sample_data <- sample_data %>%
+  mutate(sampleId = gsub("-", ".", sampleId),
+         LS_Status = ifelse(sampleId %in% TCGACOAD$Likely_Lynch, "Likely Lynch",
+                            ifelse(sampleId %in% TCGACOAD$Likely_Sporadic, "Likely Sporadic", NA)))
+
+## Remove samples that have not been triaged ####
+# Combine the IDs from Likely_Sporadic and Likely_Lynch columns
+triaged_ids <- unique(na.omit(c(TCGACOAD$Likely_Sporadic, TCGACOAD$Likely_Lynch)))
+
+# Filter sample_data
+filtered_sample_data <- sample_data[sample_data$sampleId %in% triaged_ids, ]
+
+# Identify columns to keep: Hugo_Symbol and any column whose name is in triaged_ids
+columns_to_keep <- names(mRNA_data)[names(mRNA_data) == "Hugo_Symbol" | names(mRNA_data) %in% triaged_ids]
+
+# Subset mRNA_data
+mRNA_data_filtered <- mRNA_data[, columns_to_keep]
+
+# remove rows with no data
+mRNA_data_filtered <- mRNA_data_filtered[rowSums(is.na(mRNA_data_filtered[, !names(mRNA_data_filtered) %in% "Hugo_Symbol"])) < (ncol(mRNA_data_filtered) - 1), ]
+
+##Convert sample_data to numeric ####
+columns_to_keep <- c(
+  "BRAFvec", "KB_mut_vec", "KRAS_mut_vec", "BRAF_mut_vec", "MMR_mut_vec", 
+  "MLH1_mut_vec", "MSH2_mut_vec", "PMS2_mut_vec", "EPCAM_mut_vec", "MSH6_mut_vec", 
+  "AGE", "DFS_MONTHS", "DSS_MONTHS", "OS_MONTHS", "PFS_MONTHS", 
+  "WEIGHT", "FRACTION_GENOME_ALTERED", "MUTATION_COUNT", "TMB_NONSYNONYMOUS",
+  "NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT", "PRIOR_DX", "RADIATION_THERAPY",
+  "AJCC_PATHOLOGIC_TUMOR_STAGE", "CANCER_TYPE_ACRONYM", 
+  "DSS_STATUS", "OS_STATUS", "PFS_STATUS", 
+  "PATH_M_STAGE", "PATH_N_STAGE", "PATH_T_STAGE",
+  "SEX", "AJCC_STAGING_EDITION", "CANCER_TYPE_DETAILED", "MSIvec", "sampleId", "LS_Status"
+)
+
+
+filtered_sample_data <- filtered_sample_data %>%
+  select(all_of(columns_to_keep))
+
+columns_to_process <- c("BRAFvec", "KB_mut_vec", "KRAS_mut_vec", "BRAF_mut_vec", "MMR_mut_vec", 
+                        "MLH1_mut_vec", "MSH2_mut_vec", "PMS2_mut_vec", "EPCAM_mut_vec", "MSH6_mut_vec")
+
+numeric_sample_data <- filtered_sample_data %>%
+  mutate_at(
+    .vars = columns_to_process,
+    .funs = ~coalesce(as.numeric(ifelse(grepl("negative", .), 1, ifelse(grepl("positive", .), 2, .))), 0)
+  )
+
+#convert columns to numeric
+columns_to_convert <- c("AGE", "DFS_MONTHS", "DSS_MONTHS", "OS_MONTHS", "PFS_MONTHS", 
+                        "WEIGHT", "FRACTION_GENOME_ALTERED", "MUTATION_COUNT", "TMB_NONSYNONYMOUS")
+
+numeric_sample_data[columns_to_convert] <- lapply(numeric_sample_data[columns_to_convert], as.numeric)
+
+#YN columns
+columns_to_process <- c("NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT", "PRIOR_DX", "RADIATION_THERAPY")
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(
+    .vars = columns_to_process,
+    .funs = ~coalesce(as.numeric(ifelse(. == "No", 1, ifelse(. == "Yes", 2, NA))), 0)
+  )
+
+#Tumor Stage Column 
+columns_to_process <- "AJCC_PATHOLOGIC_TUMOR_STAGE"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("IV", .), 4,
+                     ifelse(grepl("III", .), 3,
+                            ifelse(grepl("II", .), 2,
+                                   ifelse(grepl("I", .), 1, NA))))), is.na(.), 0)
+  )
+
+# Cancer Type
+columns_to_process <- "CANCER_TYPE_ACRONYM"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("READ", .), 1,
+                     ifelse(grepl("COAD", .), 2, NA))
+            ), is.na(.), 0)
+  )
+
+#DSS_Status, OS_Status, PFS_Status
+columns_to_process <- c("DSS_STATUS", "OS_STATUS", "PFS_STATUS")
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("0", .), 1,
+                     ifelse(grepl("1", .), 2, NA))
+            ), is.na(.), 0)
+  )
+
+
+# PATH_M_STAGE
+columns_to_process <- "PATH_M_STAGE"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(
+    .vars = columns_to_process,
+    .funs = ~replace(
+      as.numeric(
+        ifelse(grepl("M1B", .), 5,
+               ifelse(grepl("M1A", .), 4,
+                      ifelse(grepl("M1", .), 3,
+                             ifelse(grepl("MX", .), 2,
+                                    ifelse(grepl("M0", .), 1, NA)))))
+      ), 
+      is.na(.), 0)
+  )
+
+#PATH_N_STAGE
+columns_to_process <- "PATH_N_STAGE"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(
+    .vars = columns_to_process,
+    .funs = ~replace(
+      as.numeric(
+        ifelse(grepl("N1C", .), 9,
+               ifelse(grepl("N2A", .), 8,
+                      ifelse(grepl("N1A", .), 7,
+                             ifelse(grepl("NX", .), 6,
+                                    ifelse(grepl("N1B", .), 5,
+                                           ifelse(grepl("N1", .), 4,
+                                                  ifelse(grepl("N2B", .), 3,
+                                                         ifelse(grepl("N0", .), 2,
+                                                                ifelse(grepl("N2", .), 1, NA)))))))))
+      ), 
+      is.na(.), 0)
+  )
+
+#PATH_T_STAGE
+columns_to_process <- "PATH_T_STAGE"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(
+    .vars = columns_to_process,
+    .funs = ~replace(
+      as.numeric(
+        ifelse(grepl("T4B", .), 6,
+               ifelse(grepl("T4A", .), 5,
+                      ifelse(grepl("T4", .), 4,
+                             ifelse(grepl("T1", .), 3,
+                                    ifelse(grepl("T2", .), 2,
+                                           ifelse(grepl("T3", .), 1, NA))))))
+      ), 
+      is.na(.), 0)
+  )
+
+#SEX
+columns_to_process <- "SEX"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("Female", .), 1,
+                     ifelse(grepl("Male", .), 2, NA))
+            ), is.na(.), 0)
+  )
+
+#AJCC_STAGING_EDITION
+columns_to_process <- "AJCC_STAGING_EDITION"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("7TH", .), 3,
+                     ifelse(grepl("6TH", .), 2,
+                            ifelse(grepl("5TH", .), 1, NA)))), is.na(.), 0)
+  )
+
+#CANCER_TYPE_DETAILED
+columns_to_process <- "CANCER_TYPE_DETAILED"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("Mucinous Adenocarcinoma", .), 3,
+                     ifelse(grepl("Rectal Adenocarcinoma", .), 2,
+                            ifelse(grepl("Colon Adenocarcinoma", .), 1, NA)))), is.na(.), 0)
+  )
+
+#MSIvec
+columns_to_process <- "MSIvec"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("MSS", .), 1,
+                     ifelse(grepl("MSI", .), 2, NA))
+            ), is.na(.), 0)
+  )
+
+
+#LS_Status
+columns_to_process <- "LS_Status"
+numeric_sample_data <- numeric_sample_data %>%
+  mutate_at(.vars = columns_to_process,
+            .funs = ~ replace(as.numeric(
+              ifelse(grepl("Likely Sporadic", .), 1,
+                     ifelse(grepl("Likely Lynch", .), 2, NA))
+            ), is.na(.), 0)
+  )
+
+str(numeric_sample_data)
+
+numeric_sample_data[is.na(numeric_sample_data)] <- 0
+
+## Convert mRNA to to correct format ####
+hugo_symbols <- mRNA_data_filtered$Hugo_Symbol
+sample_ids <- colnames(mRNA_data_filtered)[-which(colnames(mRNA_data_filtered) == "Hugo_Symbol")]
+
+mRNA_transposed_matrix <- t(mRNA_data_filtered[, !names(mRNA_data_filtered) %in% "Hugo_Symbol"])
+mRNA_transposed <- as.data.frame(mRNA_transposed_matrix, stringsAsFactors = FALSE)
+colnames(mRNA_transposed) <- hugo_symbols
+
+mRNA_transposed[is.na(mRNA_transposed)] <- 0
+mRNA_transposed <- cbind(sampleId = sample_ids, mRNA_transposed)
+
+# Merge the datasets
+combined_data <- merge(mRNA_transposed, numeric_sample_data, by = "sampleId")
+
+#Balance the Classes  ####
+set.seed(123) # For reproducibility
+
+features <- combined_data[, !names(combined_data) %in% c("sampleId", "LS_Status")] # All columns except 'sampleId' and 'LS_Status'
+labels <- combined_data[["LS_Status"]]
+
+print(table(labels)) 
+
+# Apply SMOTE
+# K is the number of nearest neighbors.
+set.seed(123)
+smote_data <- SMOTE(features, as.factor(labels), K = 5, dup_size = 0)
+
+print(str(smote_data))
+
+# Extract original data 
+original_data <- combined_data[, !(names(combined_data) %in% "class")]
+
+# Extract synthetic data
+synthetic_data <- smote_data$syn_data
+
+synthetic_data$LS_Status <- as.numeric(synthetic_data$class)
+
+# Generate synthetic sample IDs
+synthetic_sampleIds <- paste("Synthetic", seq_len(nrow(synthetic_data)), sep = "_")
+
+# Add synthetic sample IDs to the synthetic data
+synthetic_data$sampleId <- synthetic_sampleIds
+
+# Drop the 'class' column from synthetic_data
+synthetic_data <- synthetic_data[, !(names(synthetic_data) %in% "class")]
+
+# Combine original and synthetic data into one balanced dataset
+balanced_data <- rbind(original_data, synthetic_data)
+
+print(str(balanced_data))
+print(head(balanced_data))
+
+#Remove columns with no variance 
+constant_columns <- sapply(balanced_data, function(col) length(unique(col)) == 1)
+constant_column_names <- names(constant_columns[constant_columns])
+balanced_data <- balanced_data[, !names(balanced_data) %in% constant_column_names]
+
+# Identify the columns to scale
+cols_to_scale <- which(names(balanced_data) != "sampleId" & names(balanced_data) != "LS_Status")
+
+# Apply scaling
+balanced_data[, cols_to_scale] <- scale(balanced_data[, cols_to_scale])
+
+# Step 2: Feature Selection using max relevance, min redundancy ####
+combined_data_forfdata <- balanced_data[, !(names(balanced_data) %in% "sampleId")]
+
+# Create mRMR data object
+f_data <- mRMR.data(combined_data_forfdata)
+
+# 'LS_Status' is the feature of interest
+target_feature_name <- "LS_Status" 
+target_index <- match(target_feature_name, f_data@feature_names)
+
+print(target_index)
+
+# Extracting the indices of the selected features from the 'filters' slot
+selected_feature_indices <- selected_features@filters[[1]]
+feature_names <- selected_features@feature_names[selected_feature_indices]
+
+# Get unique feature names
+unique_feature_names <- unique(feature_names)
+unique_feature_names
+
+selected_weights <- selected_features@scores[[1]]
+
+# Convert score to a data frame 
+scores_df <- as.data.frame(selected_features@scores[[1]])
+
+# Name the rows with the feature names
+rownames(scores_df) <- unique_feature_names[1:nrow(scores_df)]
+
+# Initialise a data frame to store the average weights for each unique feature 
+average_weights_df <- data.frame(
+  Feature = unique_feature_names,
+  AverageWeight = rep(NA, length(unique_feature_names))
+)
+
+# Calculate the average weight for each unique feature
+for(i in seq_along(unique_feature_names)) {
+  feature_name <- unique_feature_names[i]
+  # Find the indices in scores_df that match that feature_name
+  matching_indices <- which(rownames(scores_df) == feature_name)
+  # Calculate average weight for the feature across all solutions where it appears
+  if(length(matching_indices) > 0) {
+    matching_rows <- scores_df[matching_indices, , drop = FALSE]
+    average_weights_df$AverageWeight[i] <- mean(as.numeric(matching_rows), na.rm = TRUE)
+  }
+}
+
+average_weights_df <- na.omit(average_weights_df)
+
+# PLOT A BAR GRAPH TO SHOW THE DISTRIBUTION OF THE WEIGHT FOR EACH FEATURE
+ggplot(average_weights_df, aes(x = reorder(Feature, AverageWeight), y = AverageWeight)) +
+  geom_bar(stat = "identity", fill = "cornflowerblue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Feature", y = "Average Weight", title = "Distribution of Average Weights for 50 Selected Features")
+
+# Visually examine bar graph to give an indication of number of features based on their weights 
+
+# Filter the average_weights_df for features with an average weight greater than 0.1 (10%)
+filtered_features_df <- subset(average_weights_df, AverageWeight > 0.1)
+
+# Get the names of the features that meet the criterion
+selected_feature_names <- filtered_features_df$Feature
+selected_feature_names
+
+saveRDS(selected_feature_names, "~/Analysis/New/Classification/selected_feature_names.rds")
+
+column_names_to_include <- c("LS_Status", "sampleId", selected_feature_names)
+
+# Step 3. NCA - Use Python's scikit-learn for NCA  ####
+# Process data for NCA in Python 
+
+NCA_data <- balanced_data
+
+# Remove all columns that are not in column_names_to_include
+NCA_data <- subset(NCA_data, select = column_names_to_include)
+
+# Save NCA_data - follow the python script then return to Step 4
+write.csv(NCA_data, "~/Analysis/New/NCA_data.csv", row.names = FALSE)
+
+# Step 4. Clustering with k-means ####
+nca_transformed_data <- read.csv('~/Analysis/2024/2. RNA-based Classification of Colorectal Cancer (CRC)/11June/NCA_transformed.csv')
+
+#Exclude "SampleId' & "LS_Status" for clustering
+data_for_clustering <- nca_transformed_data[, !(names(nca_transformed_data) %in% c('SampleId', 'LS_Status'))]
+
+# Silhouette analysis #####
+silhouette_analysis <- data_for_clustering
+
+# Initialize variables to store results
+k_values <- 2:5
+silhouette_scores <- numeric(length(k_values))
+
+# Run K-means clustering for each K value and calculate average silhouette score
+for (k in k_values) {
+  cat("Running K-means for K =", k, "\n")
+  silhouette_vals <- numeric(500)
+  
+  for (i in 1:500) {
+    set.seed(i)  # Ensure reproducibility
+    kmeans_result <- kmeans(silhouette_analysis, centers = k, nstart = 25)
+    sil <- silhouette(kmeans_result$cluster, dist(silhouette_analysis))
+    silhouette_vals[i] <- mean(sil[, 3])  # Average silhouette value for this iteration
+  }
+  
+  silhouette_scores[k - 1] <- mean(silhouette_vals)  # Average silhouette score for this K value
+}
+
+# Determine the K value with the highest average silhouette value
+best_k <- k_values[which.max(silhouette_scores)]
+cat("The best K value is:", best_k, "with an average silhouette value of:", max(silhouette_scores), "\n")
+
+png("~/Analysis/New/Classification/silhouette_plot.png", width = 800, height = 600, res = 100)
+# visualize the results
+
+par(cex.axis = 10/12, cex.lab = 10/12)  
+
+# Increase marker size
+par(cex = 1.5) 
+
+# Visualize the results
+plot(k_values, silhouette_scores, type = "b", 
+     xlab = "Number of clusters (K)", 
+     ylab = "Average silhouette value", 
+     main = "Silhouette analysis for K-means clustering", 
+     pch = 19,  # Set marker type
+     cex = 1.5)  # Increase marker size
+
+plot(k_values, silhouette_scores, type = "b", xlab = "Number of clusters (K)", ylab = "Average silhouette value", main = "Silhouette analysis for K-means clustering")
+dev.off()
+
+# Perform K-means Clustering
+library(cluster)  # For pam (Partitioning Around Medoids) which allows different distance metrics
+
+set.seed(123)
+
+# Euclidean distance with kmeans
+kmeans_result_euclidean <- kmeans(data_for_clustering, centers = 2)
+
+# Manhattan distance with pam (as a substitute for k-means with Manhattan distance)
+pam_result_manhattan <- pam(data_for_clustering, k = 2, metric = "manhattan")
+
+pca_result <- prcomp(data_for_clustering, scale. = TRUE)
+
+# Calculate the percentage of variance explained by each principal component
+explained_variance <- summary(pca_result)$importance[2, ] * 100
+
+# Format the axis labels with the percentage of variance
+x_label <- paste0("Principal Component 1 (", round(explained_variance[1], 0), "%)")
+y_label <- paste0("Principal Component 2 (", round(explained_variance[2], 0), "%)")
+
+# Prepare data for plotting
+data_for_plotting <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  Cluster_Euclidean = as.factor(kmeans_result_euclidean$cluster),
+  Cluster_Manhattan = as.factor(pam_result_manhattan$clustering),
+  SampleId = nca_transformed_data$SampleId,  
+  LS_Status = nca_transformed_data$LS_Status  
+)
+
+#Filter out synthetic data points
+data_for_plotting <- data_for_plotting[!grepl("Synthetic", data_for_plotting$SampleId), ]
+
+# Convert LS_Status to a factor for coloring in the plot
+data_for_plotting$LS_Status <- factor(data_for_plotting$LS_Status, 
+                                      levels = c(1, 2), 
+                                      labels = c("LSp", "LLS"))
+
+cluster_colors <- c("2" = "tomato2", "1" = "cornflowerblue")
+
+# Plotting with Euclidean distance clustering results
+euclidean_plot <- ggplot(data_for_plotting, aes(x = PC1, y = PC2, color = Cluster_Euclidean)) +
+  geom_point(size = 3) +  
+  scale_color_manual(values = cluster_colors) +
+  labs(title = "mRNA Expression of Colorectal Cancer Subtypes",
+       x = x_label,
+       y = y_label,
+       color = "CRC Cluster") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14),       
+    axis.title.x = element_text(size = 14),     
+    axis.title.y = element_text(size = 14),     
+    axis.text = element_text(size = 14),        
+    legend.title = element_text(size = 14),    
+    legend.text = element_text(size = 14)       
+  )
+
+print(euclidean_plot)
+
+
+file_path <- "~/Analysis/2024/2. RNA-based Classification of Colorectal Cancer (CRC)/September Images/euclidean_plot.png"
+
+# Save the plot
+ggsave(file_path, euclidean_plot, width = 10, height = 8, dpi = 300)
+
+cluster_colors <- c("2" = "tomato2", "1" = "cornflowerblue")
+
+# Plotting with Manhattan distance clustering results
+manhattan_plot <- ggplot(data_for_plotting, aes(x = PC1, y = PC2, color = Cluster_Manhattan)) +
+  geom_point() +
+  scale_color_manual(values = cluster_colors) +
+  labs(title = "Clustering with Manhattan Distance using PCA",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Cluster") +
+  theme_minimal()
+print(manhattan_plot)
+
+file_path <- "~/Analysis/New/Classification/manhattan_plot.png"
+ggsave(file_path, manhattan_plot, width = 10, height = 8, dpi = 300)
+
+#Visualise assigned clusters 
+cluster_colors <- c("LLS" = "tomato2", "LSp" = "cornflowerblue")
+
+assigned_clusters <- ggplot(data_for_plotting, aes(x = PC1, y = PC2, color = as.factor(LS_Status))) +
+  geom_point(size = 3) +  
+  theme_minimal() +
+  labs(title = "PCA of NCA-transformed Data with K-means Clustering Showing Assigned Clusters",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  scale_color_manual(name = "CRC Cluster", values = cluster_colors) +
+  theme(
+    plot.title = element_text(size = 14),  
+    axis.title.x = element_text(size = 14),    
+    axis.title.y = element_text(size = 14),     
+    axis.text = element_text(size = 14),       
+    legend.title = element_text(size = 14),  
+    legend.text = element_text(size = 14)     
+  )
+
+# Print the plot
+print(assigned_clusters)
+
+file_path <- "~/Analysis/2024/2. RNA-based Classification of Colorectal Cancer (CRC)/September Images/PCA_plot_my_clusters.png"
+ggsave(file_path, assigned_clusters, width = 10, height = 8, dpi = 300)
+
+
+# Inspect Result for Euclidean:
+# Add cluster assignments to data
+nca_transformed_data$Cluster <- kmeans_result_euclidean$cluster
+
+# filter out synthetic samples
+real_samples <- nca_transformed_data[!grepl("Synthetic", nca_transformed_data$SampleId), ]
+
+# create a dataframe that lists real SampleId, LS_Status, and the assigned cluster
+cluster_assignments_real <- data.frame(
+  SampleId = real_samples$SampleId,
+  LS_Status = real_samples$LS_Status,
+  Cluster = real_samples$Cluster
+)
+
+# summarize the count of "Likely Lynch" and "Likely Sporadic" in each cluster
+cluster_summary_real <- cluster_assignments_real %>%
+  mutate(LS_Status = case_when(
+    LS_Status == 2 ~ "Likely Lynch Syndrome",
+    LS_Status == 1 ~ "Likely Sporadic",
+    TRUE ~ as.character(LS_Status)  
+  )) %>%
+  group_by(Cluster, LS_Status) %>%
+  summarise(Count = n(), .groups = 'drop')  
+
+# View the summary
+print(cluster_summary_real)
+
+file_path <- "~/Analysis/2024/2. RNA-based Classification of Colorectal Cancer (CRC)/11June/cluster_summary_real_euclidean.csv"
+write.csv(cluster_summary_real, file = file_path, row.names = FALSE)
+
+cluster_details_real <- cluster_assignments_real %>%
+  mutate(LS_Status = case_when(
+    LS_Status == 2 ~ "Likely Lynch Syndrome",
+    LS_Status == 1 ~ "Likely Sporadic",
+    TRUE ~ as.character(LS_Status)  
+  )) %>%
+  arrange(Cluster, LS_Status)
+
+# View the table
+print(cluster_details_real)
+
+write.csv(cluster_details_real, "~/Analysis/New/Classification/Cluster_Details_Euclidean.csv", row.names = FALSE)
+
+# Inspect Result for Manhattan:
+# Add cluster assignments to data
+nca_transformed_data$Cluster_Manhattan <- pam_result_manhattan$cluster
+
+# filter out synthetic samples
+real_samples_manhattan <- nca_transformed_data[!grepl("Synthetic", nca_transformed_data$SampleId), ]
+
+# create a dataframe that lists real SampleId, LS_Status, and the assigned cluster
+cluster_assignments_real_manhattan <- data.frame(
+  SampleId = real_samples$SampleId,
+  LS_Status = real_samples$LS_Status,
+  Cluster_Manhattan = real_samples_manhattan$Cluster_Manhattan
+)
+
+# summarize the count of "Likely Lynch" and "Likely Sporadic" in each cluster
+cluster_summary_real_manhattan <- cluster_assignments_real_manhattan %>%
+  mutate(LS_Status = case_when(
+    LS_Status == 2 ~ "Likely Lynch Syndrome",
+    LS_Status == 1 ~ "Likely Sporadic",
+    TRUE ~ as.character(LS_Status) 
+  )) %>%
+  group_by(Cluster_Manhattan, LS_Status) %>%
+  summarise(Count = n(), .groups = 'drop')  
+
+# View the summary
+print(cluster_summary_real_manhattan)
+
+file_path <- "~/Analysis/New/Classification/cluster_summary_real_manhattan.csv"
+ write.csv(cluster_summary_real_manhattan, file = file_path, row.names = FALSE)
+
+cluster_details_real_manhattan <- cluster_assignments_real_manhattan %>%
+  mutate(LS_Status = case_when(
+    LS_Status == 2 ~ "Likely Lynch Syndrome",
+    LS_Status == 1 ~ "Likely Sporadic",
+    TRUE ~ as.character(LS_Status)  
+  )) %>%
+  arrange(Cluster_Manhattan, LS_Status)
+
+# View the table
+print(cluster_details_real_manhattan)
+
+write.csv(cluster_details_real_manhattan, "~/Analysis/New/Classification/Cluster_Details_Manhattan.csv", row.names = FALSE)
+
+
+
