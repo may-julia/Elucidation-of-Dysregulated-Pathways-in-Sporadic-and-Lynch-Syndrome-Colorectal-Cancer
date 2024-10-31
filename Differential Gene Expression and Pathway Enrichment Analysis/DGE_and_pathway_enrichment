@@ -1,0 +1,256 @@
+% load the mrna expression data 
+mrna = readtable('/Users/maykrause/Documents/Masters/Analysis/2024/CRC/coadread_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt')
+
+% Find indices where 'Hugo_Symbol' is empty
+emptyIndices = cellfun('isempty', mrna.Hugo_Symbol);
+
+% Replace empty 'Hugo_Symbol' with corresponding 'Entrez_Gene_Id'
+mrna.Hugo_Symbol(emptyIndices) = cellstr(num2str(mrna.Entrez_Gene_Id(emptyIndices)));
+
+% load the sample IDs 
+allids = readtable('/Users/maykrause/Documents/Masters/Analysis/2024/3. Gene Set Enrichment Analysis (GSEA) and Functional Analysis/TCGACOAD.xlsx')
+% Replace hyphens with underscores in 'Column1'
+allids.Likely_Sporadic = strrep(allids.Likely_Sporadic, '-', '_');
+allids.Likely_Lynch = strrep(allids.Likely_Lynch, '-', '_');
+lynchIds = allids.Likely_Lynch(~cellfun('isempty', allids.Likely_Lynch));
+sporadicIds = allids.Likely_Sporadic
+
+% specify the comparison array to use for getting groups to compare to each
+% loop iteration and only get the number of comparison based on the tumour
+% subtypes selected of comparison
+tumourGroups = ["Sporadic","Lynch"];
+
+fprintf(['\n Identifying the differentially expressed genes',...
+    ' between %s %s Sporadic and %s \n'], ...
+    tumourGroups{1}, tumourGroups{2}, 'Lynch' )
+
+% set up a table to append the results
+appendTable = mrna(:,1) ;
+
+% =============================================================== %
+% get the log2 expression data to run the model faster
+lynch_mrna =  mrna{:, lynchIds }+1 ;
+sporadic_mrna = mrna{:, sporadicIds }+1 ;
+
+% perform the negative binomial test to define the p values based
+% on deSeq analysis
+tLocal = nbintest( lynch_mrna, sporadic_mrna, ...
+    'VarianceLink','LocalRegression') ;
+
+pValue = tLocal.pValue ;
+
+% get the mean values for the cell lines with metabolic alterations
+meanLynch = mean( mrna{ :, lynchIds}+1 ,2);
+meanSporadic = mean(mrna{:, sporadicIds} + 1, 2);
+
+% compute the mean and the log2FC the fold change and mean base
+meanBase = (meanLynch + meanSporadic) / 2;
+foldChange = meanLynch  ./ meanSporadic;
+log2FC = log2(meanLynch./meanSporadic) ;
+
+% add to the table
+appendTable(:,2:7) = num2cell([meanBase, meanLynch,meanSporadic, ...
+    foldChange, log2FC,pValue]);
+
+% add the variable names to the table
+appendTable.Properties.VariableNames(2:7) = ...
+    {'meanBase','meanLynch','meanSporadic','foldChange', ...
+    'log2FC','pValue'} ;
+
+% remove the rows with nan
+appendTable(isnan(appendTable.foldChange), :) = [] ;
+
+appendTable = sortrows( addvars( appendTable, ...
+    mafdr(appendTable.pValue,'BHFDR',true),...
+    'After','pValue','NewVariableNames','adjPvalue') , ...
+    'adjPvalue','ascend') ;
+
+
+% sort the rows again based on the foldchange
+appendTable = sortrows(appendTable, 'log2FC','descend');
+
+filePath = '/Users/maykrause/Documents/Masters/Analysis/2024/3. Gene Set Enrichment Analysis (GSEA) and Functional Analysis/June/MatLab/DGE_results_matlabredo.csv';
+writetable(appendTable, filePath);
+
+figure()
+histogram(pValue,100)
+xlabel('P-value')
+ylabel('Frequency')
+title('P-value enrichment')
+
+% get the figure name
+figName = [' p-value','.png'];
+saveas(gcf,figName,'png');
+
+% plot the fold change versus the mean in log scale and
+% coloring the data points according to the adjusted P-values.
+figure()
+scatter( log2(appendTable.meanBase), appendTable.log2FC, 3, ...
+    appendTable.adjPvalue,'o')
+colormap(flipud(cool(256)))
+colorbar;
+set(gca,'FontSize',12,'LineWidth',1 ,'Box','off','FontWeight','bold')
+ylabel('log2(Fold Change)')
+xlabel('log2(Mean of normalized counts)')
+title('Fold change by FDR')
+
+% get the figure name
+figName = ['Fold change by FDR','.png'];
+saveas(gcf,figName,'png');
+
+writetable( appendTable,'Diffentially Expressed Genes.xlsx')
+
+% get the genes that are up regulated in subtypes1 and subtype2
+upGenes = appendTable( appendTable.pValue < 0.05 & ...
+    appendTable.log2FC > 1 , : ) ;
+downGenes = appendTable( appendTable.pValue < 0.05 & ...
+    appendTable.log2FC < -1 , : ) ;
+
+% ======================= plot a valcono plots  ======================
+% set up the groups
+exprGroups = zeros(1,height(appendTable))' ;
+exprGroups(appendTable.pValue < 0.05 & appendTable.log2FC > 1) = 1 ;
+exprGroups(appendTable.pValue < 0.05 & appendTable.log2FC <-1) = -1;
+
+% plot another figure of the regulated genes
+% set up the colors
+colors1 = [0.1 0.1 1 ; 0.5 0.5 0.5 ; 1 0.1 0.1] ;
+
+figure()
+gscatter(appendTable.log2FC , -log(appendTable.adjPvalue), ...
+    exprGroups , colors1, '..',15)
+set(gca,'LineWidth',1,'Box','off','FontWeight','bold')
+ylabel('-log(FDR)')
+xlabel('log2(Fold Change)')
+title('Lynch vs Sporadic','FontSize',14','FontWeight','bold')
+
+% add a legend to the figure
+myLgd = { sprintf('%d Down Regulated', sum(exprGroups == -1)), ...
+    sprintf('%d None', sum(exprGroups == 0)), ...
+    sprintf('%d Up Regulated',sum(exprGroups == 1)) } ;
+legend(myLgd,'Location','Best')
+
+% get the figure name
+figName = ['Volcano_plot','.png'];
+saveas(gcf,figName,'png');
+
+% change the sort the rows
+upGenes = sortrows(upGenes, 'log2FC','descend') ;
+downGenes = sortrows(downGenes, 'log2FC','descend') ;
+upGenes = sortrows(upGenes, 'adjPvalue','ascend') ;
+downGenes = sortrows(downGenes, 'adjPvalue','ascend') ;
+
+% save results to excel to a sheet names after the sample type
+% and the day of sampling
+writetable( upGenes,'Diffentially Expressed Genes.xlsx',...
+    'Sheet','Up Genes Lynch vs Sporadic')
+writetable( downGenes, 'Diffentially Expressed Genes.xlsx',...
+    'Sheet','Up Genes Lynch vs Sporadic' )
+
+% save the file
+writecell(upGenes.Hugo_Symbol,'lynch_upgene_.txt' )
+writecell(downGenes.Hugo_Symbol,'sporadic_upgene_.txt' )
+    
+% Clear variables
+clear pvalues tscores meanSkin meanPathTissue appendTable ii ...
+    pathGroups log2FC leafOrder tLocal exprGroups aa ans ...
+    colors1 counts curTBXGroupIDs downGenes figName foldChange ...
+    genes jj locAi locBi meanBase meanNormal meanTumour myLgd ...
+    normCounts nz pseudoRefSample pValue ratios sizeFactors theUnique ...
+    tissue upGenes 
+
+%% Gene Set Enrichment Analysis Using Enrichr
+
+if ~exist('lynch_upgenes.txt','file')
+    
+    % load the data % 'Diffentially Expressed Genes.xlsx'
+    results = readtable('Diffentially Expressed Genes.xlsx');
+    
+    % get the
+    lynch_genes = results( ...
+        results.log2FC > 1 & results.pValue < 0.05 , :) ;
+    sporadic = results( ...
+        results.log2FC < -1 & results.pValue < 0.05 , :) ;
+    
+    size(lynch_genes)
+    size(sporadic)
+    
+    % save the file 
+    writecell(lynch_genes.Hugo_Symbol,'lynch_upgenes.txt' )
+    writecell(sporadic.Hugo_Symbol,'sporadic_upgenes.txt' )
+end
+
+% Run Python code then return 
+
+%% Plot results from Enrichr
+
+% set up the genes
+enrichrVars = {'GO_Molecular_Function_2023_enrichment.txt',...
+    'Reactome_2022_enrichment.txt', ...
+    'GO_Biological_Process_2023_enrichment.txt', ...
+    'WikiPathways_2019_Mouse_enrichment.txt', ...
+    'ChEA_2022_enrichment.txt', ...
+    'KEA_2015_enrichment.txt', ...
+    'KEGG_2021_Human_enrichment.txt'
+    } ;
+
+% set up the plot names
+plotNames = {'GO Mol Function','Reactome',...
+    'GO Bio Process','WikiPathways','ChEA','KEA','KEGG'} ;
+
+% here is the genes list
+myGroups =   {'Likely-Lynch','Likely-Sporadic'} ;
+myFiles =   {'lynch','sporadic'} ;
+
+% here is the directory of the results 
+enrichr_dir ='/Users/maykrause/Documents/Masters/Analysis/2024/3. Gene Set Enrichment Analysis (GSEA) and Functional Analysis/yED/enrichr_results';
+
+% plot the graphs in a loop
+for ii = 1:length(enrichrVars)
+    
+    % plot the bar graphs using a tiled layout
+    figure()
+    tiledlayout(1,2,'padding','compact');
+    set(gcf,'position',[700,500,800,500])
+    
+    % here are the group colors
+    groupColors = [0.4660 0.6740 0.1880 ; 0.8500 0.3250 0.0980] ;
+    
+    % loop over the genes
+    for jj = 1:length(myFiles)
+        
+        fprintf('\nRunning analysis for %s Enrichments\n', plotNames{ii})
+        
+        % load the data lynch_Achilles_fitness_increase_enrichment.txt
+        curEnrich = readtable( [enrichr_dir, '/', ...
+            myFiles{jj} '_' enrichrVars{ii}] , ...
+            'Format','auto') ;
+        
+        % clean up the enriched term names
+        curEnrich.Term = strtrim( regexprep(curEnrich.Term, ...
+            {'\(+\w*','\:+\w*',')','\R-HSA-+\w*','Homo sapiens',...
+            '\w* raw'},'')) ;
+        
+        nexttile
+        % create a plot and also produce the go biological data to use for
+        % the venn diagrams
+        Terms = Enrichr_One_bar_plot_logP( ...
+            curEnrich, myGroups{jj}, groupColors(jj,:) ) ;
+        
+        % save to a supplementary file
+        writetable(curEnrich, 'Lynch vs Sporadic.xlsx',...
+            'Sheet', [plotNames{ii},' - ', myFiles{jj} ] );
+        
+    end
+    
+    % add a super title
+    sgtitle(plotNames{ii} ,'FontSize', 16, 'FontWeight', 'bold' );
+    
+    % get the figure name and save the figure 
+    figName = [ replace(plotNames{ii},' ','_') ,'.png'];
+    saveas(gcf,figName,'png');
+end
+
+clear enrichEUR  enrichAFR ii plotNames enrichVars jj textPos ...
+    myNumText commonPathways enrichMYC enrichTBX3 enrichrVars ans ...
+    curEnrich enrichr_dir
