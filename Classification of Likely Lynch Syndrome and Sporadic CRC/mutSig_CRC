@@ -1,0 +1,299 @@
+# if (!require("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# 
+# BiocManager::install("BSgenome.Hsapiens.UCSC.hg38")
+
+# Required libs
+library(stringr)
+library(dplyr)
+library(readxl)
+library(tidyr)
+library(BSgenome.Hsapiens.UCSC.hg38) 
+library(maftools)
+#install.packages("fastmap")
+library(TCGAbiolinks)
+library(DT)
+library('pheatmap')
+library(ggplot2)
+
+#query & retrieve masked somatic mutation data from TCGA project for CRC Specifically targeting the "Simple Nucleotide Variation" data category.
+query <- GDCquery(
+  project = "TCGA-COAD", 
+  data.category = "Simple Nucleotide Variation", 
+  access = "open", 
+  legacy = FALSE, 
+  data.type = "Masked Somatic Mutation", 
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+
+# Check maf availables
+# Display a filtered table of query results exluding 'cases'
+datatable(dplyr::select(getResults(query),-contains("cases")),
+          filter = 'top',
+          options = list(scrollX = TRUE, keys = TRUE, pageLength = 10), 
+          rownames = FALSE)
+# Download the queried data
+GDCdownload(query)
+# Prepare downloaded data for analysis
+maf <- GDCprepare(query)
+
+# Read prepared mutation data
+COADMAF = read.maf(maf = maf)
+
+# Get sampleids
+sample_ID <- unique(maf$Tumor_Sample_Barcode)
+
+#Shows sample summary.
+getSampleSummary(COADMAF)
+#Shows gene summary.
+getGeneSummary(COADMAF)
+ 
+#shows clinical data associated with samples
+getClinicalData(COADMAF)
+#Shows all fields in MAF
+getFields(COADMAF)
+
+#2. Signatures (maftools) ####
+library("BSgenome.Hsapiens.UCSC.hg38", quietly = TRUE)
+
+#Generates a matrix that characterizes trinucleotide mutations present in the 'COADMAF' dataset. This matrix provides information about mutations occurring in the context of neighboring trinucleotide sequences. The ref_genome argument specifies the reference genome to use for mapping mutations to trinucleotides
+COADMAF.tnm = trinucleotideMatrix(maf = COADMAF, ref_genome = "BSgenome.Hsapiens.UCSC.hg38")
+
+library('NMF')
+# Extract mutational signatures from trinucleotide mutation matrix (30 signatures)
+COADMAF.sig = extractSignatures(mat = COADMAF.tnm, n = 30, pConstant = 0.01)
+
+# Compare extracted signatures with signatures from a database
+COADMAF.og30.cosm = compareSignatures(nmfRes = COADMAF.sig, sig_db = "legacy")
+
+# Create a heatmap of cosine similarities against validated signatures
+pheatmap(mat = COADMAF.og30.cosm$cosine_similarities, cluster_rows = FALSE, main = "cosine similarity against validated V2 signatures")
+pheatmap(mat = COADMAF.og30.cosm$cosine_similarities, cluster_rows = FALSE, main = "cosine similarity against validated V2 signatures",filename = "~/Analysis/2024/Signatures/11 March 2024/fig08_sig_similarity_V2.pdf",width=13,height=7)
+dev.off()
+
+best_match <- COADMAF.og30.cosm[["best_match"]]
+best_match
+
+# Initialize an empty data frame
+signatures_df <- data.frame(Signature = character(),
+                            Aetiology = character(),
+                            BestMatch = character(),
+                            Similarity = character(),
+                            stringsAsFactors = FALSE)
+
+# Loop over each signature in the 'best_match' list
+for (i in 1:length(best_match)) {
+  # Extract signature name
+  signature_name <- paste("Signature", i, sep = "_")
+  
+  # Extract aetiology and best match information
+  aetiology <- best_match[[i]]$aetiology
+  best_match_info <- best_match[[i]]$best_match
+  
+  # Extract the COSMIC signature name and similarity score from the best match information
+  cosmic_signature <- sub("Best match: (.*) \\[.*", "\\1", best_match_info)
+  similarity <- gsub(".*\\[(.*)\\].*", "\\1", best_match_info)
+  
+  # Append to the data frame
+  signatures_df <- rbind(signatures_df, 
+                         data.frame(Signature = signature_name,
+                                    Aetiology = aetiology,
+                                    BestMatch = cosmic_signature,
+                                    Similarity = similarity,
+                                    stringsAsFactors = FALSE))
+}
+
+print(signatures_df)
+
+write.csv(signatures_df, file = '~/Analysis/2024/4. Signatures/11 March 2024/signatures.csv', row.names = FALSE)
+
+# Remove signatures if the cosine similary is less than 0.85 
+filtered_signatures_df <- signatures_df %>%
+  # Extract the numerical part of the Similarity string
+  mutate(SimilarityValue = as.numeric(str_extract(Similarity, "\\d+\\.\\d+"))) %>%
+  # Filter rows where the similarity value is 0.85 or higher
+  filter(SimilarityValue >= 0.85) %>%
+  select(-SimilarityValue)
+
+# Filter the data frame for the dMMR COSMIC signatures
+cosmic_matches <- c("COSMIC_15", "COSMIC_6", "COSMIC_20", "COSMIC_26")
+
+# Filter the dataframe for rows where BestMatch is one of the cosmic_matches
+filtered_signatures_df_lynch <- filtered_signatures_df %>%
+  filter(BestMatch %in% cosmic_matches)
+
+matched_signatures <- filtered_signatures_df_lynch$Signature
+signature_indices <- match(matched_signatures, colnames(COADMAF.sig$signatures))
+
+# Subset the signatures matrix in COADMAF.sig
+selected_signatures <- COADMAF.sig$signatures[, signature_indices, drop = FALSE]
+
+# Convert the contributions matrix to a data frame
+contributions_df <- as.data.frame(COADMAF.sig$contributions)
+
+contributions_df$Signature <- rownames(COADMAF.sig$contributions)
+
+# Filter the data frame for selected signatures
+selected_contributions_df <- contributions_df %>%
+  dplyr::filter(Signature %in% matched_signatures)
+
+selected_contributions_df <- selected_contributions_df %>% select(-Signature)
+
+# Plot the selected signatures using maftools
+COADMAF.sig.dMMR <- COADMAF.sig
+
+MMR_sigs <- rownames(selected_contributions_df)
+
+# Subset only the columns for MMR sigs of the signatures matrix
+COADMAF.sig.dMMR$signatures <- COADMAF.sig.dMMR$signatures[, MMR_sigs]
+COADMAF.sig.dMMR$contributions <- COADMAF.sig.dMMR$contributions[MMR_sigs, ]
+
+# Plot only the selected signatures
+maftools::plotSignatures(nmfRes = COADMAF.sig.dMMR, title_size = 1.2, sig_db = "legacy")
+pdf("~/Analysis/2024/4. Signatures/11 March 2024/dMMRsignatures_legacy.pdf",width=13,height=7)
+maftools::plotSignatures(nmfRes = COADMAF.sig.dMMR, title_size = 1.2, sig_db = "legacy")
+dev.off()
+
+# Which samples have which signatures 
+# Transpose the contributions matrix to make samples as rows and signatures as columns
+transposed_contributions <- t(selected_contributions_df)
+
+# Convert the transposed matrix to a data frame
+contributions_df <- as.data.frame(transposed_contributions)
+
+# Add row names (Sample IDs) as a column to the data frame
+contributions_df$Sample_ID <- rownames(contributions_df)
+
+# Convert from wide to long format
+contributions_long <- pivot_longer(contributions_df, 
+                                   cols = -Sample_ID, 
+                                   names_to = "Signature", 
+                                   values_to = "Contribution")
+
+# LLS and LSp sampleids  
+TCGACOAD <- read_excel("~/Analysis/2024/CRC/TCGACOAD.xlsx")
+
+unique_sporadic_ids <- TCGACOAD$Likely_Sporadic
+unique_lynch_ids <- TCGACOAD %>%
+  filter(!is.na(Likely_Lynch)) %>%
+  distinct() %>%
+  pull()
+
+all_TCGA_sampleids_cbio <- unique(c(unique_sporadic_ids, unique_lynch_ids))
+print(all_TCGA_sampleids_cbio)
+
+# Use lapply to iterate over each ID and modify it
+modified_sample_ids <- lapply(sample_ID, function(id) {
+  parts <- unlist(strsplit(id, "-"))  # Split the ID into parts
+  # Reconstruct the ID with the first three parts and the first two numbers of the fourth part
+  modified_id <- paste(c(parts[1:3], substring(parts[4], 1, 2)), collapse = "-")
+  return(modified_id)
+})
+
+# Convert the list back to a vector
+modified_sample_ids_vector <- unlist(modified_sample_ids)
+
+# sample IDs in all_TCGA_sampleids_cbio that are not in modified_sample_ids_vector
+unique_sample_ids <- setdiff(all_TCGA_sampleids_cbio, modified_sample_ids_vector)
+print(unique_sample_ids)
+
+# LS samples with no data 
+no_data_LS_sample_ids <- intersect(unique_lynch_ids, unique_sample_ids)
+
+if(length(no_data_LS_sample_ids) > 0) {
+  print(paste("The following likely LS samples do not have maf files:", paste(no_data_LS_sample_ids, collapse = ", ")))
+} else {
+  print("There are no likely LS samples without maf files.")
+}
+
+# Filter modified_sample_ids_vector to keep only those IDs present in all_TCGA_sampleids_cbio
+filtered_sample_ids <- modified_sample_ids_vector[modified_sample_ids_vector %in% all_TCGA_sampleids_cbio]
+cohort <- unique(filtered_sample_ids)
+
+# Modify the Sample_ID in contributions_long to match the format in filtered_sample_ids
+modified_contributions <- contributions_long %>%
+  mutate(Modified_Sample_ID = sapply(Sample_ID, function(id) {
+    parts <- unlist(strsplit(id, "-"))  # Split the ID into parts
+    # Reconstruct the ID with the first three parts and the first two numbers of the fourth part
+    modified_id <- paste(c(parts[1:3], substring(parts[4], 1, 2)), collapse = "-")
+    return(modified_id)
+  }))
+
+# Filter rows in modified_contributions where Modified_Sample_ID matches any ID in filtered_sample_ids
+final_filtered_contributions <- modified_contributions[modified_contributions$Modified_Sample_ID %in% filtered_sample_ids, ]
+
+# Adding the LS_Status column to final_filtered_contributions
+final_filtered_contributions <- final_filtered_contributions %>%
+  mutate(LS_Status = case_when(
+    Modified_Sample_ID %in% unique_sporadic_ids ~ "Likely_Sporadic",
+    Modified_Sample_ID %in% unique_lynch_ids ~ "Likely_Lynch",
+    TRUE ~ NA_character_  
+  ))
+
+#Number of unique samples for likely LS and likely sporadic in the filitered dataframe
+counts <- final_filtered_contributions %>%
+  filter(!is.na(LS_Status)) %>%
+  group_by(LS_Status) %>%
+  summarise(Count = n_distinct(Modified_Sample_ID))
+
+print(counts)
+
+# Get likely lynch samples that have no signatures associated with dMMR
+likely_lynch_sample_ids <- unique(final_filtered_contributions$Modified_Sample_ID[final_filtered_contributions$LS_Status == "Likely_Lynch"])
+
+# Find sample IDs in unique_lynch_ids not in likely_lynch_sample_ids
+lynch_ids_no_sigs_dMMR <- setdiff(unique_lynch_ids, likely_lynch_sample_ids)  #Explore these
+
+print(paste("The following sample/s have no signatures related to dMMR and are likely LS:", paste(lynch_ids_no_sigs_dMMR, collapse = ", ")))
+
+# Checking if both vectors contain the same elements regardless of order
+are_equal_sets <- setequal(lynch_ids_no_sigs_dMMR, no_data_LS_sample_ids)
+
+if(are_equal_sets) {
+  print("These likely LS samples with no signatures related to dMMR actually have no data availible to test for signatures.")
+} else {
+  print("Some of these samples do have data availible, please check which these are.")
+}
+
+# Set a threshold for significant contributions
+significant_threshold <- 0.1 # 10% threshold
+
+# Filter the data frame to keep only significant contributions
+threshold_contributions <- final_filtered_contributions %>%
+  filter(Contribution >= significant_threshold)
+
+counts <- threshold_contributions %>%
+  filter(!is.na(LS_Status)) %>%
+  group_by(LS_Status) %>%
+  summarise(Count = n_distinct(Modified_Sample_ID))
+
+print(counts)
+
+write.csv(threshold_contributions, file = "~/Analysis/2024/4. Signatures/07June/threshold_contributions_dmmr_sigs.csv", row.names = FALSE)
+
+unique_modified_sample_ids <- unique(threshold_contributions$Modified_Sample_ID)
+
+overlap_sample_ids <- intersect(unique_lynch_ids, unique_modified_sample_ids)
+print(paste("The following samples have signatures related to dMMR and are likely LS:", paste(overlap_sample_ids, collapse = ", ")))
+
+overlap_sample_ids_sporadic <- intersect(unique_sporadic_ids, unique_modified_sample_ids)
+print(paste("The following samples have signatures related to dMMR and are likely sporadic:", paste(overlap_sample_ids_sporadic, collapse = ", ")))
+
+# Counting the number of sample IDs
+num_samples <- length(overlap_sample_ids_sporadic)
+
+# Printing the message with the count and the IDs
+print(paste("There are", num_samples, "likely sporadic samples with signatures related to dMMR"))
+
+
+
+
+
+
+
+
+
+
+
+
+
