@@ -1,0 +1,57 @@
+import os
+import requests
+
+# Ensure the enrichr_results directory exists
+results_dir = '/Users/maykrause/Documents/Masters/Analysis/2024/October/Endometrial/GSEA/With Age/enrichr_results'
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
+
+# Load genes from a file
+with open('/Users/maykrause/Documents/Masters/Analysis/2024/October/Endometrial/GSEA/With Age/lynch_upgenes.txt', 'r') as file:
+    genes_str = file.read()
+
+# List of databases to iterate over
+databases = [
+    'GO_Molecular_Function_2023',
+    'Reactome_2022',
+    'GO_Biological_Process_2023',
+    'WikiPathway_2019_Mouse',
+    'ChEA_2022'
+    'KEA_2015',
+    'KEGG_2021_Human',
+]
+
+# Enrichr URLs
+ENRICHR_URL_ADDLIST = 'https://maayanlab.cloud/Enrichr/addList'
+ENRICHR_URL_EXPORT = 'https://maayanlab.cloud/Enrichr/export'
+
+# Submit gene list to Enrichr
+description = 'May Gene List'
+payload = {
+    'list': (None, genes_str),
+    'description': (None, description)
+}
+response = requests.post(ENRICHR_URL_ADDLIST, files=payload)
+if not response.ok:
+    raise Exception('Error analyzing gene list')
+
+data = response.json()
+user_list_id = data['userListId']
+print(f"User List ID: {user_list_id}")
+
+# Download enrichment results for each database
+for database in databases:
+    # CHANGE THE FILE NAEM TO BE SAVED ON TEH COMPUTER
+    filename = f'lynch_{database}_enrichment.txt'
+    file_path = os.path.join(results_dir, filename)
+    
+    # Construct the export URL with query parameters
+    export_url = f"{ENRICHR_URL_EXPORT}?userListId={user_list_id}&filename={filename}&backgroundType={database}"
+    
+    # Stream download the file
+    with requests.get(export_url, stream=True) as r:
+        r.raise_for_status()
+        with open(file_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    print(f"Results for {database} saved to {file_path}")
